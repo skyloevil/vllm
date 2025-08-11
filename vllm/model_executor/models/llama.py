@@ -144,6 +144,9 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        
+        # Cache QKV split sizes for performance optimization
+        self._qkv_split_sizes = [self.q_size, self.kv_size, self.kv_size]
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -191,7 +194,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split(self._qkv_split_sizes, dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
