@@ -47,6 +47,12 @@ class PerformanceBenchmark:
         prompt_tokens = list(range(1, num_prompt_tokens + 1))
         output_tokens = list(range(num_prompt_tokens + 1, num_prompt_tokens + num_output_tokens + 1))
         
+        # Calculate number of blocks needed for this request
+        total_tokens = num_prompt_tokens + num_output_tokens
+        # For block_size=16, we need ceil(total_tokens/16) blocks per group
+        blocks_needed_group1 = max(1, (total_tokens + 15) // 16)  # Round up division
+        blocks_needed_group2 = max(1, (total_tokens + 31) // 32)  # Round up division for block_size=32
+        
         return CachedRequestState(
             req_id=req_id,
             prompt_token_ids=prompt_tokens,
@@ -55,7 +61,11 @@ class PerformanceBenchmark:
             sampling_params=SamplingParams(temperature=0.7, top_p=0.9, top_k=50),
             pooling_params=None,
             generator=None,
-            block_ids=([list(range(10))], [list(range(10, 20))]),  # Mock block IDs for 2 groups
+            # Fix: Correct block_ids format - each group is a simple list, not nested
+            block_ids=(
+                list(range(blocks_needed_group1)),           # Group 1 blocks
+                list(range(100, 100 + blocks_needed_group2))  # Group 2 blocks (different range)
+            ),
             num_computed_tokens=num_prompt_tokens,
             output_token_ids=output_tokens,
         )
