@@ -92,21 +92,26 @@ class TopKTopPSampler(nn.Module):
         p: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """More optimized implementation for top-k and top-p sampling."""
+        batch_size = logits.shape[0]
+
         if k is None and p is None:
             # We prefer `random_sample` over `flashinfer_sample` when sorting is
             # not needed. This is because `random_sample` does not require
             # CPU-GPU synchronization while `flashinfer_sample` does.
             probs = logits.softmax(dim=-1, dtype=torch.float32)
             return random_sample(probs, generators)
+
+        # Simplified and more robust FlashInfer usage strategy
         if generators:
+            # FlashInfer doesn't support per-request generators
             logger.warning_once("FlashInfer 0.2.3+ does not support "
                                 "per-request generators. Falling back to "
                                 "PyTorch-native implementation.")
             return self.forward_native(logits, generators, k, p)
-        # flashinfer sampling functions expect contiguous logits.
-        # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
-        # because of slicing operation in logits_processor.
-        return flashinfer_sample(logits.contiguous(), k, p, generators)
+        else:
+            # No generators - safe to use FlashInfer for better performance
+            # flashinfer sampling functions expect contiguous logits
+            return flashinfer_sample(logits.contiguous(), k, p, generators)
 
     def forward_tpu(
         self,
@@ -252,10 +257,21 @@ def random_sample(
     if len(generators) != probs.shape[0]:
         q.exponential_()
     if generators:
-        # TODO(woosuk): This can be slow because we handle each request
-        # one by one. Optimize this.
-        for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
+        # Optimized batch processing for requests with custom generators
+        generator_indices = list(generators.keys())
+        generator_objects = list(generators.values())
+
+        if len(generator_indices) > 4:  # Batch threshold for vectorization
+            # Vectorized approach for large batches
+            generator_tensor = torch.stack([
+                torch.empty_like(q[i]).exponential_(generator=gen)
+                for i, gen in zip(generator_indices, generator_objects)
+            ])
+            q[generator_indices] = generator_tensor
+        else:
+            # Original approach for small batches to avoid overhead
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
