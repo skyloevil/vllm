@@ -261,7 +261,11 @@ def random_sample(
         generator_indices = list(generators.keys())
         generator_objects = list(generators.values())
 
-        if len(generator_indices) > 4:  # Batch threshold for vectorization
+        # Dynamic threshold: higher for larger batches where vectorization pays off more
+        # 4 for small batches, up to 8 for very large batches
+        batch_size = probs.shape[0]
+        vectorization_threshold = min(4 + batch_size // 32, 8)
+        if len(generator_indices) > vectorization_threshold:
             # Vectorized approach for large batches
             generator_tensor = torch.stack([
                 torch.empty_like(q[i]).exponential_(generator=gen)
