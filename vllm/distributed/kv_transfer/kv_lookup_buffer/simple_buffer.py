@@ -12,7 +12,7 @@
 """
 import threading
 from collections import deque
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Tuple
 
 import torch
 
@@ -40,6 +40,11 @@ class SimpleBuffer(KVLookupBufferBase):
         """
 
         self.buffer: deque[list[torch.Tensor]] = deque()
+        # Hash table for O(1) lookup: hash_key -> buffer_index
+        self.token_hash_table: Dict[str, int] = {}
+        # Track buffer index for each item for efficient removal
+        self.buffer_indices: deque[int] = deque()
+        self._next_buffer_index = 0
 
         self.buffer_size = 0
         self.buffer_size_threshold = buffer_size_thresh
@@ -50,6 +55,31 @@ class SimpleBuffer(KVLookupBufferBase):
 
         self.normal_signal = torch.tensor([0], device="cpu")
         self.end_signal = None
+
+    def _compute_token_hash(self, tokens: torch.Tensor, roi: torch.Tensor) -> str:
+        """
+        Compute a hash key for tokens with ROI for O(1) lookup.
+        
+        Args:
+            tokens: Input tokens tensor
+            roi: Region of interest mask tensor
+            
+        Returns:
+            String hash key for the token sequence
+        """
+        if tokens is None:
+            # Empty request case - return special key
+            return "*"
+        
+        # Extract relevant tokens using ROI mask
+        relevant_tokens = tokens[roi]
+        
+        # Create hash from token values - convert to tuple for hashing
+        # Use a combination of token values and length for better distribution
+        token_tuple = tuple(relevant_tokens.cpu().numpy().tolist())
+        hash_key = f"{len(token_tuple)}:{hash(token_tuple)}"
+        
+        return hash_key
 
     def _matches(self, tokens_roi_sender: list[torch.Tensor],
                  tokens_roi_recver: list[torch.Tensor]):
@@ -126,8 +156,20 @@ class SimpleBuffer(KVLookupBufferBase):
                 while self.buffer_size + data_size > self.buffer_size_threshold:
                     self.buffer_cv.wait()
 
+            # Compute hash key for the new item
+            hash_key = self._compute_token_hash(input_tokens, roi)
+            
+            # Assign unique buffer index
+            buffer_index = self._next_buffer_index
+            self._next_buffer_index += 1
+            
             self.buffer_size += data_size
             self.buffer.append(buffer_item)
+            self.buffer_indices.append(buffer_index)
+            
+            # Add to hash table for O(1) lookup
+            self.token_hash_table[hash_key] = buffer_index
+            
             self.buffer_cv.notify()
 
     def _is_end_signal(self, signal):
@@ -153,17 +195,63 @@ class SimpleBuffer(KVLookupBufferBase):
 
                 def is_buffer_available(
                     tokens_roi_recver: list[torch.Tensor], ) -> bool:
-                    # perform input tokens and roi matching
-                    # FIXME: this matching is O(n), ideally it should be O(1)
-                    # but this buffer size won't (and shouldn't) be too large so
-                    # the fix is not urgent.
-                    for _ in range(len(self.buffer)):
-                        if self._matches(self.buffer[0],
-                                         tokens_roi_recver) > 0:
-                            return True
-                        # rotate the element we just accessed to the end
-                        self.buffer.rotate(-1)
+                    # Optimized O(1) hash table lookup instead of O(n) iteration
+                    input_tokens = tokens_roi_recver[0]
+                    roi = tokens_roi_recver[1]
+                    
+                    # Compute hash key for the query
+                    query_hash_key = self._compute_token_hash(input_tokens, roi)
+                    
+                    # O(1) hash table lookup
+                    if query_hash_key in self.token_hash_table:
+                        return True
+                        
+                    # Special case: if query is empty ("*"), match any available item
+                    if query_hash_key == "*" and len(self.buffer) > 0:
+                        return True
+                    
                     return False
+
+                def find_and_remove_matching_item(
+                    tokens_roi_recver: list[torch.Tensor], ) -> list[torch.Tensor]:
+                    # Optimized O(1) lookup and removal
+                    input_tokens = tokens_roi_recver[0]
+                    roi = tokens_roi_recver[1]
+                    
+                    query_hash_key = self._compute_token_hash(input_tokens, roi)
+                    
+                    # Handle empty query case (drop select any item)
+                    if query_hash_key == "*" and len(self.buffer) > 0:
+                        # Remove first available item
+                        matched_item = self.buffer.popleft()
+                        removed_index = self.buffer_indices.popleft()
+                        
+                        # Clean up hash table - find and remove the corresponding entry
+                        for key, index in list(self.token_hash_table.items()):
+                            if index == removed_index:
+                                del self.token_hash_table[key]
+                                break
+                        
+                        return matched_item
+                    
+                    # Normal case: find exact match using hash table
+                    if query_hash_key in self.token_hash_table:
+                        target_index = self.token_hash_table[query_hash_key]
+                        
+                        # Find the item in buffer with matching index
+                        for i, (item, item_index) in enumerate(zip(self.buffer, self.buffer_indices)):
+                            if item_index == target_index:
+                                # Remove item from buffer and indices
+                                self.buffer.remove(item)
+                                self.buffer_indices.remove(item_index)
+                                
+                                # Remove from hash table
+                                del self.token_hash_table[query_hash_key]
+                                
+                                return item
+                    
+                    # Should not reach here if is_buffer_available returned True
+                    raise RuntimeError("Matching item not found despite availability check")
 
                 with self.buffer_cv:
                     while not is_buffer_available(tokens_roi_recver):
@@ -172,7 +260,7 @@ class SimpleBuffer(KVLookupBufferBase):
                         self.buffer_cv.wait()
                     # need to clone the tensor
                     # in case the tensor is freed before sending finishes
-                    matched_item = self.buffer.popleft()
+                    matched_item = find_and_remove_matching_item(tokens_roi_recver)
                     for tensor in matched_item:
                         self._send_tensor_and_dec_size(tensor)
                     self.buffer_cv.notify()
