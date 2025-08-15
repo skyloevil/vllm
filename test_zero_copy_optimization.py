@@ -236,7 +236,11 @@ class ProductionWorkloadSimulator:
         total_tokens = total_requests * 150  # Approximate average tokens per request
         
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
-        memory_usage = final_memory - initial_memory
+        memory_usage = abs(final_memory - initial_memory)  # Use absolute value to handle small variations
+        
+        # If memory usage is very small, use a small positive value to avoid division by zero
+        if memory_usage < 0.1:
+            memory_usage = 0.1
         
         # Get memory efficiency from input batch if available
         memory_efficiency = 0.85  # Default estimate
@@ -364,10 +368,10 @@ class ProductionWorkloadSimulator:
             baseline_val = getattr(baseline, attr)
             optimized_val = getattr(optimized, attr)
             
-            if baseline_val > 0:
+            if baseline_val > 0 and optimized_val > 0:
                 if 'Latency' in name or 'Memory Usage' in name or 'CPU Usage' in name:
                     # Lower is better
-                    improvement = baseline_val / optimized_val if optimized_val > 0 else float('inf')
+                    improvement = baseline_val / optimized_val
                     improvement_str = f"{improvement:.2f}x faster" if improvement > 1 else f"{1/improvement:.2f}x slower"
                 else:
                     # Higher is better
@@ -397,19 +401,19 @@ class ZeroCopyOptimizationBenchmark:
         latency_improvements = []
         memory_improvements = []
         
-        for scenario_name, scenario_results in results.items():
+        for _, scenario_results in results.items():
             baseline = scenario_results['baseline']
             optimized = scenario_results['optimized']
             
-            if baseline.throughput_requests_per_sec > 0:
+            if baseline.throughput_requests_per_sec > 0 and optimized.throughput_requests_per_sec > 0:
                 throughput_improvement = optimized.throughput_requests_per_sec / baseline.throughput_requests_per_sec
                 throughput_improvements.append(throughput_improvement)
             
-            if baseline.avg_latency_ms > 0:
+            if baseline.avg_latency_ms > 0 and optimized.avg_latency_ms > 0:
                 latency_improvement = baseline.avg_latency_ms / optimized.avg_latency_ms
                 latency_improvements.append(latency_improvement)
             
-            if baseline.memory_usage_mb > 0:
+            if baseline.memory_usage_mb > 0 and optimized.memory_usage_mb > 0:
                 memory_improvement = baseline.memory_usage_mb / optimized.memory_usage_mb
                 memory_improvements.append(memory_improvement)
         
