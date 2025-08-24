@@ -165,11 +165,26 @@ DEFAULT_BLOCK_SIZE = [128, 128]
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/dd6ed14acbc7445dcef224248a77ab4d22b5f240/deep_gemm/utils/math.py#L38
-# TODO(wentao): optimize this function, using triton or cuda kernel
 def per_block_cast_to_fp8(
         x: torch.Tensor,
         block_size: list[int] = DEFAULT_BLOCK_SIZE,
         use_ue8m0: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optimized per-block FP8 casting with Triton kernel acceleration.
+    
+    This function automatically selects between the optimized Triton kernel
+    implementation and the fallback PyTorch implementation based on tensor
+    size and hardware capabilities.
+    """
+    # Try to use optimized version first
+    try:
+        from vllm.utils.fp8_triton_kernel import (
+            per_block_cast_to_fp8_optimized)
+        return per_block_cast_to_fp8_optimized(x, block_size, use_ue8m0)
+    except ImportError:
+        # Fallback to original PyTorch implementation
+        pass
+
+    # Original PyTorch implementation (preserved as fallback)
     assert x.dim() == 2
     m, n = x.shape
     block_m, block_n = block_size
