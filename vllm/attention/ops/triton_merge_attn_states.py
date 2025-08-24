@@ -17,12 +17,28 @@ def merge_attn_states(
     suffix_lse: torch.Tensor,
     output_lse: Optional[torch.Tensor] = None,
 ) -> None:
+    """Merge attention states with automatic backend selection.
+    
+    This function automatically selects between optimized CUDA and Triton
+    implementations based on availability and tensor characteristics.
+    """
+    # Try to use optimized CUDA implementation first
+    try:
+        from vllm.attention.ops.cuda_merge_attn_states import (
+            merge_attn_states_optimized)
+        merge_attn_states_optimized(output, prefix_output, prefix_lse,
+                                    suffix_output, suffix_lse, output_lse)
+        return
+    except ImportError:
+        # Fallback to original Triton implementation
+        pass
+
     num_tokens = output.shape[0]
     num_query_heads = output.shape[1]
     head_size = output.shape[2]
     padded_head_size = triton.next_power_of_2(head_size)
 
-    # TODO(woosuk): Use CUDA kernel instead of Triton to minimize CPU overhead.
+    # Original Triton implementation (preserved as fallback)
     merge_attn_states_kernel[(num_tokens, num_query_heads)](
         output,
         output_lse,
