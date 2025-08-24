@@ -15,6 +15,9 @@ class NgramProposer:
         assert vllm_config.speculative_config.prompt_lookup_min is not None
         assert vllm_config.speculative_config.prompt_lookup_max is not None
 
+        # Store config for optimized proposer initialization
+        self.vllm_config = vllm_config
+
         # Minimum length of the n-gram to match.
         self.min_n = vllm_config.speculative_config.prompt_lookup_min
         # Maximum length of the n-gram to match.
@@ -39,6 +42,9 @@ class NgramProposer:
         tokens in the previous context, and returns k tokens that followed 
         that match.
         
+        This function automatically selects the most appropriate algorithm
+        based on input characteristics for optimal performance.
+        
         Args:
             context_token_ids: Numpy array of token IDs representing the 
                                context sequence.
@@ -58,7 +64,19 @@ class NgramProposer:
               followed that pattern. Here we will return [4,2,3] because 
               we only have three tokens after the match.
         """
-        # TODO(woosuk): Optimize this.
+        # Try optimized implementations first
+        try:
+            from vllm.v1.spec_decode.optimized_ngram_proposer import (
+                OptimizedNgramProposer)
+            if not hasattr(self, '_optimized_proposer'):
+                self._optimized_proposer = OptimizedNgramProposer(
+                    self.vllm_config)
+            return self._optimized_proposer.propose(context_token_ids)
+        except ImportError:
+            # Fallback to original implementation
+            pass
+
+        # Original KMP-based implementation (preserved as fallback)
         return _find_longest_matched_ngram_and_propose_tokens(
             origin_tokens=context_token_ids,
             min_ngram=self.min_n,
