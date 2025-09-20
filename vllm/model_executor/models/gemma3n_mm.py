@@ -468,6 +468,15 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal,
         self.embed_audio = Gemma3nMultimodalEmbedder(config.audio_config,
                                                      config.text_config)
 
+        # Cache for audio padding helpers to avoid per-request allocations.
+        self.register_buffer(
+            "_audio_padding_token",
+            torch.tensor([[self.vocab_size - 1]], dtype=torch.long),
+            persistent=False,
+        )
+        self._audio_pad_embed_cache: dict[tuple[torch.device, torch.dtype],
+                                          torch.Tensor] = {}
+
         self.language_model: nn.Module = init_vllm_registered_model(
             vllm_config=vllm_config,
             hf_config=config.text_config,
@@ -580,30 +589,43 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal,
         audio_outputs, audio_mask = self.audio_tower(input_features,
                                                      ~input_features_mask)
         audio_features = self.embed_audio(inputs_embeds=audio_outputs)
+        pad_embed = self._get_audio_pad_embedding(audio_features.device,
+                                                  audio_features.dtype)
 
-        # ruff: noqa
-        # The Gemma3nProcessor expects all audio will be 30s in length and inserts 188 audio soft tokens into the
-        # text to account for this. However, the audio preprocessing and encoder do not guarantee they will
-        # produce 188 soft tokens; they will produce at most that many tokens, but they may produce fewer tokens
-        # depending on the length of the longest audio input in the batch. When we encounter this situation, we pad
-        # the audio feature out to 188 soft tokens with the embedding of the last token in the embed_audio vocab.
-        # TODO precompute and cache padding
-        audio_padding_toks = torch.tensor([[self.vocab_size - 1]],
-                                          dtype=torch.long,
-                                          device=audio_features.device)
-        audio_padding_embs = self.embed_audio(input_ids=audio_padding_toks)
-        audio_features = torch.where(audio_mask.unsqueeze(-1),
-                                     audio_padding_embs, audio_features)
+        # Gemma3n processor pads shorter clips out to a fixed soft-token
+        # length; reuse cached pad embedding to avoid extra allocations.
+        if audio_mask.any():
+            audio_features[audio_mask] = pad_embed
 
         audio_batch_size, audio_seq_len, audio_embed_dim = audio_features.shape
-        extra_padding_tokens = self.config.audio_soft_tokens_per_image - audio_seq_len  # noqa: E501
-        extra_padding_features = audio_padding_embs.expand(
-            audio_batch_size, extra_padding_tokens, audio_embed_dim)
+        target_seq_len = self.config.audio_soft_tokens_per_image
 
-        audio_features = torch.cat((audio_features, extra_padding_features),
-                                   dim=1)
+        if audio_seq_len < target_seq_len:
+            pad_embed_expanded = pad_embed.view(1, 1, -1)
+            padded_features = pad_embed_expanded.expand(
+                audio_batch_size, target_seq_len, -1).clone()
+            padded_features[:, :audio_seq_len].copy_(audio_features)
+            audio_features = padded_features
+        elif audio_seq_len > target_seq_len:
+            audio_features = audio_features[:, :target_seq_len]
+
         # Return a list of embeddings instead of a batched tensor
         return audio_features.unbind(0)
+
+    def _get_audio_pad_embedding(self, device: torch.device,
+                                 dtype: torch.dtype) -> torch.Tensor:
+        cache_key = (device, dtype)
+        cached = self._audio_pad_embed_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        padding_token = self._audio_padding_token.to(device)
+        pad_embed = self.embed_audio(input_ids=padding_token)
+        pad_embed = pad_embed.squeeze(0).squeeze(0)
+        if pad_embed.dtype != dtype:
+            pad_embed = pad_embed.to(dtype)
+        self._audio_pad_embed_cache[cache_key] = pad_embed
+        return pad_embed
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
@@ -638,8 +660,8 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal,
         # NOTE (NickLucche) Each pass needs tokens to compute PLE so we cache
         # them here, as the model  forward has only access to the input_embeds.
         if input_ids is not None:
-            per_layer_inputs = self.language_model.model.get_per_layer_input_embeddings(
-                input_ids)
+            per_layer_inputs = (self.language_model.model.
+                                get_per_layer_input_embeddings(input_ids))
             per_layer_inputs = per_layer_inputs.reshape(
                 -1, self.config.text_config.num_hidden_layers,
                 self.config.text_config.hidden_size_per_layer_input)
@@ -693,7 +715,9 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsMultiModal,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self._audio_pad_embed_cache.clear()
+        return loaded
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """
