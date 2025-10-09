@@ -271,6 +271,15 @@ if __name__ == "__main__":
         print("Running on CPU (slower but functional)")
     print(f"PyTorch version: {torch.__version__}\n")
 
+    # Initialize PyTorch distributed backend first
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            world_size=1,
+            rank=0,
+            init_method="tcp://localhost:12355",
+        )
+
     # Initialize vLLM distributed environment
     # Required for VocabParallelEmbedding used in position_embedding
     print("Initializing model parallel (tensor_parallel_size=1)...")
