@@ -17,6 +17,7 @@ import time
 import torch
 from transformers import SiglipVisionConfig
 
+from vllm.distributed import initialize_model_parallel
 from vllm.model_executor.models.siglip import SiglipVisionEmbeddings
 
 
@@ -269,6 +270,12 @@ if __name__ == "__main__":
     else:
         print("Running on CPU (slower but functional)")
     print(f"PyTorch version: {torch.__version__}\n")
+
+    # Initialize vLLM distributed environment
+    # Required for VocabParallelEmbedding used in position_embedding
+    print("Initializing model parallel (tensor_parallel_size=1)...")
+    initialize_model_parallel(tensor_model_parallel_size=1)
+    print("Initialization complete.\n")
 
     try:
         test_numerical_accuracy()
