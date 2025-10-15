@@ -593,6 +593,107 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
+# Module-level helper functions for efficient caching
+# These are extracted to avoid LRU cache issues with instance methods
+@lru_cache(maxsize=128)
+def _get_window_index_thw_cached(
+    grid_t: int,
+    grid_h: int,
+    grid_w: int,
+    window_size: int,
+    spatial_merge_size: int,
+    patch_size: int,
+    spatial_merge_unit: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute window indices for temporal-height-width grid.
+
+    This pure function enables efficient LRU caching without the issues of
+    caching instance methods. Previously this was a method on
+    Qwen2_5_VisionTransformer with @lru_cache, but caching instance methods:
+    1) Holds references to 'self', preventing garbage collection in scenarios
+       where model objects are recreated (e.g., testing environments, notebook
+       experimentation, or when model instances are replaced)
+    2) Includes 'self' in the cache key, reducing cache effectiveness
+    3) Triggers flake8-bugbear B019 warning for this anti-pattern
+
+    Extracting to a pure function provides better caching semantics and
+    follows Python best practices.
+    """
+    vit_merger_window_size = window_size // spatial_merge_size // patch_size
+
+    llm_grid_h = grid_h // spatial_merge_size
+    llm_grid_w = grid_w // spatial_merge_size
+    index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
+        grid_t, llm_grid_h, llm_grid_w
+    )
+    pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+    pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+    num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+    num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+    index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
+    index_padded = index_padded.reshape(
+        grid_t,
+        num_windows_h,
+        vit_merger_window_size,
+        num_windows_w,
+        vit_merger_window_size,
+    )
+    index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
+        grid_t,
+        num_windows_h * num_windows_w,
+        vit_merger_window_size,
+        vit_merger_window_size,
+    )
+    seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+    index_padded = index_padded.reshape(-1)
+    index_new = index_padded[index_padded != -100]
+    cu_seqlens_tmp = seqlens.cumsum(0) * spatial_merge_unit
+    cu_seqlens_tmp = cu_seqlens_tmp.to(dtype=torch.int32)
+    cu_seqlens_tmp = torch.unique_consecutive(cu_seqlens_tmp)
+
+    return index_new, cu_seqlens_tmp
+
+
+@lru_cache(maxsize=128)
+def _get_rotary_pos_ids_thw_cached(
+    t: int,
+    h: int,
+    w: int,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    """Compute position IDs for rotary embeddings.
+
+    This pure function computes position IDs for temporal-height-width
+    dimensions. Extracted to module level to avoid the issues with caching
+    instance methods (see _get_window_index_thw_cached docstring).
+    """
+    hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+    wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+    hpos_ids = (
+        hpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        )
+        .permute(0, 2, 1, 3)
+        .flatten()
+    )
+    wpos_ids = (
+        wpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        )
+        .permute(0, 2, 1, 3)
+        .flatten()
+    )
+    pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
+
+    return pos_ids
+
+
 class Qwen2_5_VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
@@ -725,29 +826,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rotary_pos_emb_thw(self, t, h, w):
-        hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-        wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-        hpos_ids = (
-            hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            .permute(0, 2, 1, 3)
-            .flatten()
-        )
-        wpos_ids = (
-            wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            .permute(0, 2, 1, 3)
-            .flatten()
-        )
-        pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
+        # Use cached pure function for position ID computation
+        pos_ids = _get_rotary_pos_ids_thw_cached(t, h, w, self.spatial_merge_size)
         max_size = max(h, w)
         rotary_pos_emb_full = self.rotary_pos_emb(max_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
@@ -760,44 +840,24 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return rotary_pos_emb
 
     def get_window_index_thw(self, grid_t, grid_h, grid_w):
-        vit_merger_window_size = (
-            self.window_size // self.spatial_merge_size // self.patch_size
-        )
-
-        llm_grid_h = grid_h // self.spatial_merge_size
-        llm_grid_w = grid_w // self.spatial_merge_size
-        index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
-            grid_t, llm_grid_h, llm_grid_w
-        )
-        pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
-        pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
-        num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
-        num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
-        index_padded = F.pad(index, (0, pad_w, 0, pad_h), "constant", -100)
-        index_padded = index_padded.reshape(
+        # Delegate to cached pure function for efficient caching
+        return _get_window_index_thw_cached(
             grid_t,
-            num_windows_h,
-            vit_merger_window_size,
-            num_windows_w,
-            vit_merger_window_size,
+            grid_h,
+            grid_w,
+            self.window_size,
+            self.spatial_merge_size,
+            self.patch_size,
+            self.spatial_merge_unit,
         )
-        index_padded = index_padded.permute(0, 1, 3, 2, 4).reshape(
-            grid_t,
-            num_windows_h * num_windows_w,
-            vit_merger_window_size,
-            vit_merger_window_size,
-        )
-        seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
-        index_padded = index_padded.reshape(-1)
-        index_new = index_padded[index_padded != -100]
-        cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit
-        cu_seqlens_tmp = cu_seqlens_tmp.to(dtype=torch.int32)
-        cu_seqlens_tmp = torch.unique_consecutive(cu_seqlens_tmp)
 
-        return index_new, cu_seqlens_tmp
-
-    @lru_cache(maxsize=1024)  # noqa: B019
     def get_rope_by_thw(self, t, h, w):
+        # Note: Removed @lru_cache decorator that was on this method (with
+        # noqa: B019 to suppress warning). Using @lru_cache on instance methods
+        # is an anti-pattern that can prevent garbage collection and reduces
+        # cache effectiveness. The expensive computations are now cached via
+        # module-level pure functions (_get_window_index_thw_cached and
+        # _get_rotary_pos_ids_thw_cached) for better performance.
         window_index_thw, cu_seqlens_window_thw = self.get_window_index_thw(t, h, w)
         rotary_pos_emb_thw = self.rotary_pos_emb_thw(t, h, w)
         rotary_pos_emb_thw = rotary_pos_emb_thw[window_index_thw, :, :]
