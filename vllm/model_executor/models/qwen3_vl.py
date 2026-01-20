@@ -68,7 +68,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
-    compute_retained_tokens_count,
     compute_retention_mask,
     recompute_mrope_positions,
 )
@@ -977,7 +976,123 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             processed_outputs,
             **video_outputs,
         )
+
+        # Two-Pass EVS: Run Pass 1 to compute EVS info for prompt construction
+        if video_outputs and self._is_two_pass_evs_enabled():
+            evs_data = self._run_pass1_evs(
+                video_outputs["pixel_values_videos"],
+                video_outputs["video_grid_thw"]
+            )
+            combined_outputs.update(evs_data)
+
         return BatchFeature(combined_outputs)
+
+    def _is_two_pass_evs_enabled(self) -> bool:
+        """Check if Two-Pass EVS should be enabled."""
+        mm_config = self.info.ctx.get_mm_config()
+        return (
+            mm_config.video_pruning_rate is not None
+            and mm_config.video_pruning_rate > 0.0
+        )
+
+    def _run_pass1_evs(
+        self,
+        pixel_values_videos: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+    ) -> dict:
+        """
+        Pass 1: Run vision encoder and compute EVS retention info.
+
+        This runs during prompt construction (CPU stage) to determine which
+        tokens will be retained, enabling accurate per-frame timestamp generation.
+
+        Args:
+            pixel_values_videos: Concatenated pixel values for all videos
+            video_grid_thw: Grid dimensions (T, H, W) for each video
+            videos: Original video items with metadata
+
+        Returns:
+            Dictionary containing:
+            - evs_retention_mask: Boolean mask for retained tokens
+            - evs_per_frame_counts: List of token counts per retained frame
+            - evs_retained_frame_indices: List of original frame indices retained
+            - cached_video_embeds: Pre-computed embeddings with mRoPE positions
+        """
+        from vllm.multimodal.evs import (
+            compute_evs_info_for_video,
+            compute_mrope_for_media,
+        )
+
+        # Get vision config
+        vision_config = self.info.get_hf_config().vision_config
+        spatial_merge_size = vision_config.spatial_merge_size
+        pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
+
+        # Create temporary vision encoder for Pass 1
+        vision_encoder = self._create_vision_encoder_for_pass1(vision_config)
+
+        # Process each video
+        retention_masks = []
+        per_frame_counts_list = []
+        retained_frame_indices_list = []
+        cached_embeds_list = []
+
+        # Split pixel values by video
+        video_grid_sizes = video_grid_thw.prod(dim=-1) // (spatial_merge_size ** 2)
+        pixel_values_split = pixel_values_videos.split(video_grid_sizes.tolist())
+
+        for video_pixels, grid_thw in zip(pixel_values_split, video_grid_thw):
+            # Run vision encoder (Pass 1)
+            with torch.no_grad():
+                # Reshape for vision encoder input
+                video_embeds = vision_encoder(
+                    video_pixels.unsqueeze(0),
+                    grid_thw=grid_thw.unsqueeze(0)
+                )
+                video_embeds = video_embeds.squeeze(0)  # Remove batch dim
+
+            # Compute mRoPE positions
+            positions = compute_mrope_for_media(
+                grid_thw,
+                spatial_merge_size,
+                tokens_per_second=getattr(vision_config, "tokens_per_second", 1.0),
+                video_second_per_grid=1.0
+            )
+
+            # Compute EVS retention info (now includes retained frame indices)
+            retention_mask, per_frame_counts, retained_frame_indices = \
+                compute_evs_info_for_video(
+                    video_embeds,
+                    tuple(grid_thw.tolist()),
+                    spatial_merge_size,
+                    pruning_rate
+                )
+
+            # Concatenate embeddings + positions for caching
+            video_embeds_with_pos = torch.cat([video_embeds, positions], dim=1)
+
+            retention_masks.append(retention_mask)
+            per_frame_counts_list.append(per_frame_counts)
+            retained_frame_indices_list.append(retained_frame_indices)
+            cached_embeds_list.append(video_embeds_with_pos)
+
+        return {
+            "evs_retention_mask": torch.cat(retention_masks),
+            "evs_per_frame_counts": per_frame_counts_list,
+            "evs_retained_frame_indices": retained_frame_indices_list,
+            "cached_video_embeds": torch.cat(cached_embeds_list)
+        }
+
+    def _create_vision_encoder_for_pass1(self, vision_config):
+        """Create temporary vision encoder instance for Pass 1."""
+        # Import here to avoid circular dependency
+        encoder = Qwen3_VisionTransformer(
+            vision_config=vision_config,
+            norm_eps=1e-6,
+            quant_config=None
+        )
+        encoder.eval()
+        return encoder
 
     def _get_mm_fields_config(
         self,
@@ -990,7 +1105,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         video_grid_thw = hf_inputs.get("video_grid_thw", torch.empty((0, 3)))
         video_grid_sizes = video_grid_thw.prod(-1)
 
-        return dict(
+        configs = dict(
             pixel_values=MultiModalFieldConfig.flat_from_sizes(
                 "image", image_grid_sizes
             ),
@@ -1006,6 +1121,35 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             ),
             video_grid_thw=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
         )
+
+        # Add Two-Pass EVS fields if present
+        if "evs_retention_mask" in hf_inputs:
+            # Total tokens per video (before merge)
+            vision_config = self.info.get_hf_config().vision_config
+            spatial_merge_size = vision_config.spatial_merge_size
+            total_tokens_per_video = video_grid_sizes // (spatial_merge_size ** 2)
+
+            configs.update({
+                "evs_retention_mask": MultiModalFieldConfig.flat_from_sizes(
+                    "video",
+                    total_tokens_per_video,
+                    keep_on_cpu=True  # Metadata, keep on CPU
+                ),
+                "evs_per_frame_counts": MultiModalFieldConfig.batched(
+                    "video",
+                    keep_on_cpu=True  # Python list, keep on CPU
+                ),
+                "evs_retained_frame_indices": MultiModalFieldConfig.batched(
+                    "video",
+                    keep_on_cpu=True  # Python list of frame indices
+                ),
+                "cached_video_embeds": MultiModalFieldConfig.flat_from_sizes(
+                    "video",
+                    total_tokens_per_video  # Same size as original embeddings
+                ),
+            })
+
+        return configs
 
     def _get_prompt_updates(
         self,
@@ -1042,43 +1186,49 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             sampled_fps = hf_processor_mm_kwargs.get("fps")
             if is_list_of(sampled_fps, float):
                 sampled_fps = sampled_fps[item_idx]
-            timestamps = self.info._get_video_second_idx(
-                metadata, out_item, do_sample_frames, sampled_fps
-            )
 
-            assert len(timestamps) == grid_thw[0], (
-                f"The timestamps length({len(timestamps)}) should be equal "
-                f"video length ({grid_thw[0]})."
-            )
+            # Check if Two-Pass EVS data is available
+            evs_per_frame_counts = out_item.get("evs_per_frame_counts")
+            evs_retained_frame_indices = out_item.get("evs_retained_frame_indices")
 
-            frames_idx_token = [
-                tokenizer.encode(f"<{curr_time:.1f} seconds>", add_special_tokens=False)
-                for curr_time in timestamps
-            ]
-            tokens_per_frame = int(grid_thw[1:].prod()) // merge_length
-            per_frame_token_counts = [tokens_per_frame for _ in frames_idx_token]
+            if evs_per_frame_counts is not None and evs_retained_frame_indices is not None:
+                # Two-Pass EVS mode: Use exact per-frame counts from Pass 1
+                per_frame_token_counts = evs_per_frame_counts.data
+                retained_indices = evs_retained_frame_indices.data
 
-            video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
-            if video_pruning_rate is not None and video_pruning_rate > 0.0:
-                total_retained = compute_retained_tokens_count(
-                    tokens_per_frame,
-                    len(frames_idx_token),
-                    video_pruning_rate,
+                # Get all timestamps for the video
+                all_timestamps = self.info._get_video_second_idx(
+                    metadata, out_item, do_sample_frames, sampled_fps
                 )
-                if len(frames_idx_token) == 0:
-                    per_frame_token_counts = []
-                elif len(frames_idx_token) == 1:
-                    per_frame_token_counts = [tokens_per_frame]
-                else:
-                    first_frame_tokens = tokens_per_frame
-                    remaining_tokens = max(total_retained - first_frame_tokens, 0)
-                    base = remaining_tokens // (len(frames_idx_token) - 1)
-                    remainder = remaining_tokens % (len(frames_idx_token) - 1)
-                    per_frame_token_counts = [first_frame_tokens]
-                    for frame_idx in range(1, len(frames_idx_token)):
-                        extra = base + (1 if (frame_idx - 1) < remainder else 0)
-                        per_frame_token_counts.append(extra)
 
+                # Select timestamps only for retained frames (correct semantic mapping)
+                # e.g., if frames 0, 2, 5 were retained, use timestamps[0], timestamps[2], timestamps[5]
+                timestamps = [all_timestamps[i] for i in retained_indices]
+
+                # Tokenize timestamps for retained frames only
+                frames_idx_token = [
+                    tokenizer.encode(f"<{curr_time:.1f} seconds>", add_special_tokens=False)
+                    for curr_time in timestamps
+                ]
+            else:
+                # Non-EVS mode: Use theoretical token counts (uniform per frame)
+                timestamps = self.info._get_video_second_idx(
+                    metadata, out_item, do_sample_frames, sampled_fps
+                )
+
+                assert len(timestamps) == grid_thw[0], (
+                    f"The timestamps length({len(timestamps)}) should be equal "
+                    f"video length ({grid_thw[0]})."
+                )
+
+                frames_idx_token = [
+                    tokenizer.encode(f"<{curr_time:.1f} seconds>", add_special_tokens=False)
+                    for curr_time in timestamps
+                ]
+                tokens_per_frame = int(grid_thw[1:].prod()) // merge_length
+                per_frame_token_counts = [tokens_per_frame for _ in frames_idx_token]
+
+            # Build placeholder using exact per_frame_token_counts
             placeholder = []
             for frame_idx, timestamp_tokens in enumerate(frames_idx_token):
                 placeholder.extend(timestamp_tokens)
@@ -1490,8 +1640,10 @@ class Qwen3VLForConditionalGeneration(
         video_input: Qwen2_5_VLVideoInputs,
     ) -> tuple[torch.Tensor, ...]:
         """
+        Pass 2: Apply EVS pruning using cached results from Pass 1 if available.
+
         Prunes video embeddings via Efficient Video Sampling (EVS)
-        and then appends mrope positions for each retained embeddings
+        and then appends mrope positions for each retained embeddings.
 
         Args:
             video_embeds_split: Tuple of video embeddings for each video item.
@@ -1502,6 +1654,61 @@ class Qwen3VLForConditionalGeneration(
             Resulting embeddings will have extra 4 channels for
             computed mrope positions.
         """
+        # Check if Two-Pass EVS cached results are available
+        cached_embeds = video_input.get("cached_video_embeds")
+        retention_masks = video_input.get("evs_retention_mask")
+
+        if cached_embeds is not None and retention_masks is not None:
+            # Two-Pass mode: Reuse Pass 1 results
+            return self._apply_cached_evs_results(
+                cached_embeds, retention_masks, video_input
+            )
+        else:
+            # Legacy mode: Compute EVS dynamically
+            return self._compute_evs_dynamically(
+                video_embeds_split, video_input
+            )
+
+    def _apply_cached_evs_results(
+        self,
+        cached_embeds: torch.Tensor,
+        retention_masks: torch.Tensor,
+        video_input: Qwen2_5_VLVideoInputs,
+    ) -> tuple[torch.Tensor, ...]:
+        """Apply cached EVS results from Pass 1."""
+        grid_thw = video_input["video_grid_thw"]
+        grid_thw_list = grid_thw.tolist()
+        merge_size = self.visual.spatial_merge_size
+
+        # Calculate token counts per video
+        sizes = [
+            (t * h * w // merge_size // merge_size)
+            for t, h, w in grid_thw_list
+        ]
+
+        # Split cached embeddings and masks by video
+        cached_embeds_split = cached_embeds.split(sizes)
+        retention_masks_split = retention_masks.split(sizes)
+
+        video_embeds_out = []
+        for emb, mask in zip(cached_embeds_split, retention_masks_split):
+            # Transfer to GPU
+            emb = emb.to(self.device)
+            mask = mask.to(self.device)
+
+            # Apply retention mask (direct indexing, no recomputation needed)
+            emb = emb[mask]
+
+            video_embeds_out.append(emb)
+
+        return tuple(video_embeds_out)
+
+    def _compute_evs_dynamically(
+        self,
+        video_embeds_split: tuple[torch.Tensor, ...],
+        video_input: Qwen2_5_VLVideoInputs,
+    ) -> tuple[torch.Tensor, ...]:
+        """Fallback: Compute EVS on-the-fly (original implementation)."""
         grid_thw = video_input["video_grid_thw"]
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()

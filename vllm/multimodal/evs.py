@@ -292,3 +292,76 @@ def recompute_mrope_positions(
 
     mrope_positions_delta = (positions.max() + 1 - N).item()
     return positions, mrope_positions_delta
+
+
+def compute_evs_info_for_video(
+    video_embeds: torch.Tensor,
+    video_size_thw: tuple[int, int, int],
+    spatial_merge_size: int,
+    pruning_rate: float,
+) -> tuple[torch.Tensor, list[int], list[int]]:
+    """
+    Compute EVS retention mask and per-frame token counts for Two-Pass EVS.
+
+    This function is used in Pass 1 (CPU stage) to determine which tokens
+    will be retained after EVS pruning, enabling accurate prompt construction
+    with correct per-frame timestamps.
+
+    Args:
+        video_embeds: Video embeddings of shape (T*H*W//merge², hidden_dim)
+        video_size_thw: Tuple of (T, H, W) representing temporal, height,
+            and width dimensions
+        spatial_merge_size: Spatial merge size for dimension reduction
+        pruning_rate: EVS pruning rate in [0, 1)
+
+    Returns:
+        Tuple of (retention_mask, per_frame_counts, retained_frame_indices) where:
+        - retention_mask: Boolean tensor of shape (T*H*W//merge²,) indicating
+            which tokens are retained
+        - per_frame_counts: List of integers representing token count for each
+            retained frame. Frames with zero tokens are excluded.
+        - retained_frame_indices: List of original frame indices that were
+            retained (not completely pruned). Used for correct timestamp mapping.
+
+    Example:
+        >>> video_embeds = torch.randn(4900, 1024)  # 7 frames, 28x28 per frame
+        >>> thw = (7, 28, 28)
+        >>> mask, counts, indices = compute_evs_info_for_video(
+        ...     video_embeds, thw, merge_size=2, pruning_rate=0.3
+        ... )
+        >>> mask.shape
+        torch.Size([4900])
+        >>> len(counts)  # <= 7 (some frames may be fully pruned)
+        6
+        >>> len(indices) == len(counts)
+        True
+        >>> sum(counts) == mask.sum().item()
+        True
+    """
+    # Compute retention mask using existing EVS algorithm
+    retention_mask = compute_retention_mask(
+        video_embeds, video_size_thw, spatial_merge_size, pruning_rate
+    )
+
+    # Extract per-frame token counts from the mask
+    T, H, W = video_size_thw
+    tokens_per_frame = (H // spatial_merge_size) * (W // spatial_merge_size)
+
+    # Reshape mask to (T, tokens_per_frame) to analyze frame-wise retention
+    mask_per_frame = retention_mask.view(T, tokens_per_frame)
+
+    # Count retained tokens per frame
+    per_frame_counts_tensor = mask_per_frame.sum(dim=1)  # Shape: (T,)
+
+    # Identify which frames are retained (have at least one token)
+    frame_retained = per_frame_counts_tensor > 0  # Shape: (T,)
+    retained_frame_indices = torch.where(frame_retained)[0].tolist()
+
+    # Filter out frames with zero tokens and convert to Python list
+    per_frame_counts = [
+        int(count.item())
+        for count in per_frame_counts_tensor
+        if count.item() > 0
+    ]
+
+    return retention_mask, per_frame_counts, retained_frame_indices
