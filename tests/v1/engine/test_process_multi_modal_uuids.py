@@ -209,3 +209,29 @@ def test_multi_modal_uuids_ignored_when_caching_disabled(monkeypatch):
     assert mm_uuids["video"][0].startswith(f"{request_id}-video-") and mm_uuids[
         "video"
     ][0].endswith("-0")
+
+
+def test_process_inputs_sets_current_vllm_config(monkeypatch):
+    input_processor = _mock_input_processor(monkeypatch)
+
+    observed = {}
+
+    def fake_preprocess(
+        prompt, *, tokenization_kwargs=None, lora_request=None, mm_uuids=None
+    ):
+        from vllm.config import get_current_vllm_config_or_none
+
+        observed["config"] = get_current_vllm_config_or_none()
+        return {"type": "token", "prompt_token_ids": [1]}
+
+    monkeypatch.setattr(
+        input_processor.input_preprocessor, "preprocess", fake_preprocess, raising=True
+    )
+
+    input_processor.process_inputs(
+        request_id="req-ctx",
+        prompt="Hello",  # type: ignore[arg-type]
+        params=SamplingParams(),
+    )
+
+    assert observed["config"] is input_processor.vllm_config

@@ -1057,6 +1057,14 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
 
         # Split pixel values by video
         video_grid_sizes = video_grid_thw.prod(dim=-1) // (spatial_merge_size ** 2)
+        expected_total_tokens = int(video_grid_sizes.sum().item()) if video_grid_sizes.numel() else 0
+        logger.debug(
+            "[Two-Pass EVS] Pass 1 token check: expected_total_tokens=%d, "
+            "pixel_values_videos=%d, num_videos=%d",
+            expected_total_tokens,
+            pixel_values_videos.shape[0],
+            video_grid_thw.shape[0],
+        )
         pixel_values_split = pixel_values_videos.split(video_grid_sizes.tolist())
 
         for video_pixels, grid_thw in zip(pixel_values_split, video_grid_thw):
@@ -1104,6 +1112,11 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             "evs_retained_frame_indices": retained_frame_indices_list,
             "cached_video_embeds": torch.cat(cached_embeds_list)
         }
+        logger.debug(
+            "[Two-Pass EVS] Pass 1 summary: retention_mask=%d, cached_embeds=%d",
+            result["evs_retention_mask"].numel(),
+            result["cached_video_embeds"].shape[0],
+        )
         logger.debug(f"[Two-Pass EVS] Pass 1 completed: "
                     f"retention_mask shape={result['evs_retention_mask'].shape}, "
                     f"cached_embeds shape={result['cached_video_embeds'].shape}")
@@ -1240,6 +1253,11 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 # Two-Pass EVS mode: Use exact per-frame counts from Pass 1
                 per_frame_token_counts = evs_per_frame_counts.data
                 retained_indices = evs_retained_frame_indices.data
+                logger.debug(
+                    "[Two-Pass EVS] Two-Pass counts: frames=%d, total_tokens=%d",
+                    len(per_frame_token_counts),
+                    sum(per_frame_token_counts) if per_frame_token_counts else 0,
+                )
 
                 # Log field types for debugging
                 logger.debug(f"[Two-Pass EVS] Two-Pass mode: "
@@ -1289,7 +1307,12 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 ]
                 tokens_per_frame = int(grid_thw[1:].prod()) // merge_length
                 per_frame_token_counts = [tokens_per_frame for _ in frames_idx_token]
-                logger.debug(f"[Two-Pass EVS] Non-EVS: frames={len(timestamps)}, tokens_per_frame={tokens_per_frame}")
+                logger.debug(
+                    "[Two-Pass EVS] Non-EVS: frames=%d, tokens_per_frame=%d, total_tokens=%d",
+                    len(timestamps),
+                    tokens_per_frame,
+                    tokens_per_frame * len(timestamps),
+                )
 
             # Build placeholder using exact per_frame_token_counts
             placeholder = []
@@ -1748,6 +1771,12 @@ class Qwen3VLForConditionalGeneration(
             (t * h * w // merge_size // merge_size)
             for t, h, w in grid_thw_list
         ]
+        logger.debug(
+            "[Two-Pass EVS] Apply cached: cached_embeds=%s, retention_masks=%s, sizes=%s",
+            tuple(cached_embeds.shape),
+            tuple(retention_masks.shape),
+            sizes,
+        )
 
         # Split cached embeddings and masks by video
         cached_embeds_split = cached_embeds.split(sizes)
@@ -1760,6 +1789,12 @@ class Qwen3VLForConditionalGeneration(
             mask = mask.to(self.device)
 
             # Apply retention mask (direct indexing, no recomputation needed)
+            logger.debug(
+                "[Two-Pass EVS] Apply cached per-video: emb=%s, mask=%s, keep=%d",
+                tuple(emb.shape),
+                tuple(mask.shape),
+                int(mask.sum().item()),
+            )
             emb = emb[mask]
 
             video_embeds_out.append(emb)

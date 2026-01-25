@@ -6,7 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Literal, cast
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
 from vllm.inputs.parse import split_enc_dec_inputs
@@ -507,7 +507,11 @@ class InputProcessor:
                 num_threads,
             )
 
-        with set_request_id(request_id), set_default_torch_num_threads(num_threads):
+        with (
+            set_request_id(request_id),
+            set_default_torch_num_threads(num_threads),
+            set_current_vllm_config(self.vllm_config),
+        ):
             processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
