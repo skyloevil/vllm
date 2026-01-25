@@ -978,22 +978,34 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         )
 
         # Two-Pass EVS: Run Pass 1 to compute EVS info for prompt construction
-        if video_outputs and self._is_two_pass_evs_enabled():
-            evs_data = self._run_pass1_evs(
-                video_outputs["pixel_values_videos"],
-                video_outputs["video_grid_thw"]
-            )
-            combined_outputs.update(evs_data)
+        two_pass_enabled = self._is_two_pass_evs_enabled()
+        logger.debug(f"[Two-Pass EVS] _call_hf_processor: video_outputs={bool(video_outputs)}, "
+                    f"two_pass_enabled={two_pass_enabled}")
+        if video_outputs and two_pass_enabled:
+            logger.debug("[Two-Pass EVS] Triggering Pass 1...")
+            try:
+                evs_data = self._run_pass1_evs(
+                    video_outputs["pixel_values_videos"],
+                    video_outputs["video_grid_thw"]
+                )
+                combined_outputs.update(evs_data)
+                logger.debug(f"[Two-Pass EVS] Pass 1 data added to combined_outputs: {list(evs_data.keys())}")
+            except Exception as e:
+                logger.warning(f"[Two-Pass EVS] Pass 1 failed, falling back to legacy mode: {e}")
+        else:
+            logger.debug(f"[Two-Pass EVS] Pass 1 skipped: video_outputs={bool(video_outputs)}, "
+                        f"two_pass_enabled={two_pass_enabled}")
 
         return BatchFeature(combined_outputs)
 
     def _is_two_pass_evs_enabled(self) -> bool:
         """Check if Two-Pass EVS should be enabled."""
         mm_config = self.info.ctx.get_mm_config()
-        return (
-            mm_config.video_pruning_rate is not None
-            and mm_config.video_pruning_rate > 0.0
-        )
+        pruning_rate = mm_config.video_pruning_rate
+        enabled = pruning_rate is not None and pruning_rate > 0.0
+        logger.debug(f"[Two-Pass EVS] _is_two_pass_evs_enabled: "
+                    f"video_pruning_rate={pruning_rate}, enabled={enabled}")
+        return enabled
 
     def _run_pass1_evs(
         self,
