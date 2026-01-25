@@ -1123,14 +1123,25 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         return result
 
     def _create_vision_encoder_for_pass1(self, vision_config):
-        """Create temporary vision encoder instance for Pass 1."""
-        # Import here to avoid circular dependency
+        """Create temporary vision encoder instance for Pass 1.
+        
+        Uses mm_encoder_tp_mode="data" to disable tensor parallel, avoiding
+        the need for distributed group initialization in APIServer process.
+        """
+        from vllm.config.multimodal import MultiModalConfig
+        
         try:
             logger.debug("[Two-Pass EVS] Creating vision encoder for Pass 1...")
+            
+            # Create a MultiModalConfig with mm_encoder_tp_mode="data" to disable TP
+            # This avoids the "tensor model parallel group is not initialized" error
+            mm_config = MultiModalConfig(mm_encoder_tp_mode="data")
+            
             encoder = Qwen3_VisionTransformer(
                 vision_config=vision_config,
                 norm_eps=1e-6,
-                quant_config=None
+                quant_config=None,
+                multimodal_config=mm_config,
             )
             encoder.eval()
             logger.debug("[Two-Pass EVS] Vision encoder created successfully")
