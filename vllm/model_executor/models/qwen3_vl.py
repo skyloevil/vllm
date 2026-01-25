@@ -1023,13 +1023,19 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             compute_mrope_for_media,
         )
 
+        logger.debug("[Two-Pass EVS] Pass 1 started")
+        logger.debug(f"[Two-Pass EVS] pixel_values_videos shape: {pixel_values_videos.shape}")
+        logger.debug(f"[Two-Pass EVS] video_grid_thw: {video_grid_thw}")
+
         # Get vision config
         vision_config = self.info.get_hf_config().vision_config
         spatial_merge_size = vision_config.spatial_merge_size
         pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
+        logger.debug(f"[Two-Pass EVS] spatial_merge_size={spatial_merge_size}, pruning_rate={pruning_rate}")
 
         # Create temporary vision encoder for Pass 1
         vision_encoder = self._create_vision_encoder_for_pass1(vision_config)
+        logger.debug("[Two-Pass EVS] Vision encoder created")
 
         # Process each video
         retention_masks = []
@@ -1067,6 +1073,10 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     spatial_merge_size,
                     pruning_rate
                 )
+            logger.debug(f"[Two-Pass EVS] Video processed: grid_thw={grid_thw.tolist()}, "
+                        f"per_frame_counts={per_frame_counts}, "
+                        f"retained_frame_indices={retained_frame_indices}, "
+                        f"retention_mask sum={retention_mask.sum().item()}")
 
             # Concatenate embeddings + positions for caching
             video_embeds_with_pos = torch.cat([video_embeds, positions], dim=1)
@@ -1076,23 +1086,33 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             retained_frame_indices_list.append(retained_frame_indices)
             cached_embeds_list.append(video_embeds_with_pos)
 
-        return {
+        result = {
             "evs_retention_mask": torch.cat(retention_masks),
             "evs_per_frame_counts": per_frame_counts_list,
             "evs_retained_frame_indices": retained_frame_indices_list,
             "cached_video_embeds": torch.cat(cached_embeds_list)
         }
+        logger.debug(f"[Two-Pass EVS] Pass 1 completed: "
+                    f"retention_mask shape={result['evs_retention_mask'].shape}, "
+                    f"cached_embeds shape={result['cached_video_embeds'].shape}")
+        return result
 
     def _create_vision_encoder_for_pass1(self, vision_config):
         """Create temporary vision encoder instance for Pass 1."""
         # Import here to avoid circular dependency
-        encoder = Qwen3_VisionTransformer(
-            vision_config=vision_config,
-            norm_eps=1e-6,
-            quant_config=None
-        )
-        encoder.eval()
-        return encoder
+        try:
+            logger.debug("[Two-Pass EVS] Creating vision encoder for Pass 1...")
+            encoder = Qwen3_VisionTransformer(
+                vision_config=vision_config,
+                norm_eps=1e-6,
+                quant_config=None
+            )
+            encoder.eval()
+            logger.debug("[Two-Pass EVS] Vision encoder created successfully")
+            return encoder
+        except Exception as e:
+            logger.error(f"[Two-Pass EVS] Failed to create vision encoder: {e}")
+            raise
 
     def _get_mm_fields_config(
         self,
@@ -1124,10 +1144,16 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
 
         # Add Two-Pass EVS fields if present
         if "evs_retention_mask" in hf_inputs:
+            logger.debug("[Two-Pass EVS] Registering EVS fields in _get_mm_fields_config")
             # Total tokens per video (before merge)
             vision_config = self.info.get_hf_config().vision_config
             spatial_merge_size = vision_config.spatial_merge_size
             total_tokens_per_video = video_grid_sizes // (spatial_merge_size ** 2)
+            logger.debug(f"[Two-Pass EVS] total_tokens_per_video: {total_tokens_per_video}")
+
+            # Check what fields are available in hf_inputs
+            evs_keys = [k for k in hf_inputs.keys() if k.startswith("evs_") or k.startswith("cached_")]
+            logger.debug(f"[Two-Pass EVS] EVS-related keys in hf_inputs: {evs_keys}")
 
             configs.update({
                 "evs_retention_mask": MultiModalFieldConfig.flat_from_sizes(
@@ -1148,6 +1174,9 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     total_tokens_per_video  # Same size as original embeddings
                 ),
             })
+            logger.debug("[Two-Pass EVS] EVS fields registered successfully")
+        else:
+            logger.debug("[Two-Pass EVS] No EVS fields in hf_inputs, skipping EVS field registration")
 
         return configs
 
@@ -1190,28 +1219,49 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             # Check if Two-Pass EVS data is available
             evs_per_frame_counts = out_item.get("evs_per_frame_counts")
             evs_retained_frame_indices = out_item.get("evs_retained_frame_indices")
+            logger.debug(f"[Two-Pass EVS] get_video_replacement: item_idx={item_idx}, "
+                        f"grid_thw={grid_thw.tolist()}, "
+                        f"evs_per_frame_counts={evs_per_frame_counts}, "
+                        f"evs_retained_frame_indices={evs_retained_frame_indices}")
 
             if evs_per_frame_counts is not None and evs_retained_frame_indices is not None:
                 # Two-Pass EVS mode: Use exact per-frame counts from Pass 1
                 per_frame_token_counts = evs_per_frame_counts.data
                 retained_indices = evs_retained_frame_indices.data
 
+                # Log field types for debugging
+                logger.debug(f"[Two-Pass EVS] Two-Pass mode: "
+                            f"per_frame_token_counts type={type(per_frame_token_counts)}, value={per_frame_token_counts}, "
+                            f"retained_indices type={type(retained_indices)}, value={retained_indices}")
+
                 # Get all timestamps for the video
                 all_timestamps = self.info._get_video_second_idx(
                     metadata, out_item, do_sample_frames, sampled_fps
                 )
+                logger.debug(f"[Two-Pass EVS] all_timestamps (len={len(all_timestamps)}): {all_timestamps}")
+
+                # Validate indices before accessing
+                max_idx = max(retained_indices) if retained_indices else -1
+                if max_idx >= len(all_timestamps):
+                    logger.error(f"[Two-Pass EVS] Index out of bounds! max_idx={max_idx}, "
+                                f"len(all_timestamps)={len(all_timestamps)}, "
+                                f"retained_indices={retained_indices}")
+                    raise IndexError(f"retained_indices contains {max_idx} but all_timestamps has only {len(all_timestamps)} elements")
 
                 # Select timestamps only for retained frames (correct semantic mapping)
                 # e.g., if frames 0, 2, 5 were retained, use timestamps[0], timestamps[2], timestamps[5]
                 timestamps = [all_timestamps[i] for i in retained_indices]
+                logger.debug(f"[Two-Pass EVS] selected timestamps: {timestamps}")
 
                 # Tokenize timestamps for retained frames only
                 frames_idx_token = [
                     tokenizer.encode(f"<{curr_time:.1f} seconds>", add_special_tokens=False)
                     for curr_time in timestamps
                 ]
+                logger.debug(f"[Two-Pass EVS] frames_idx_token count: {len(frames_idx_token)}")
             else:
                 # Non-EVS mode: Use theoretical token counts (uniform per frame)
+                logger.debug("[Two-Pass EVS] Non-EVS mode (legacy)")
                 timestamps = self.info._get_video_second_idx(
                     metadata, out_item, do_sample_frames, sampled_fps
                 )
@@ -1227,6 +1277,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 ]
                 tokens_per_frame = int(grid_thw[1:].prod()) // merge_length
                 per_frame_token_counts = [tokens_per_frame for _ in frames_idx_token]
+                logger.debug(f"[Two-Pass EVS] Non-EVS: frames={len(timestamps)}, tokens_per_frame={tokens_per_frame}")
 
             # Build placeholder using exact per_frame_token_counts
             placeholder = []
