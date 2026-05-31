@@ -1,0 +1,44 @@
+name: Daily vLLM Sync & Multimodal Digest
+
+# Runs at 08:00 CST (UTC+8) = 00:00 UTC every day.
+# Can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to push synced main
+  issues: write     # needed to create the digest issue
+
+jobs:
+  sync-and-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync main with upstream vllm-project/vllm
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote add upstream https://github.com/vllm-project/vllm.git
+          git fetch upstream main --no-tags
+          # Hard-reset so fork main is byte-for-byte identical to upstream main
+          git reset --hard upstream/main
+          git push origin main --force-with-lease
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate and post multimodal digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/multimodal_digest.py
